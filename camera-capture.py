@@ -347,7 +347,9 @@ def experiment() -> None:
             distances_cm=DISTANCES,
             id=None,
         )
-        exps.store_experiment(conn, yolo.model_name, "test", [TARGET_CLASS])
+        exps.store_experiment(
+            conn, yolo.model_name, "green_camo_darker_plus_plus", [TARGET_CLASS]
+        )
 
         ## Run experiments in a loop
         ## Case where user wants to re run experiments
@@ -369,6 +371,16 @@ def experiment() -> None:
     finally:
         camera.release()
         cv2.destroyAllWindows()
+
+
+def list_ports():
+    for i in range(10):
+        camera = cv2.VideoCapture(i)
+        alive, img = camera.read()
+        if not alive:
+            continue
+        else:
+            print(camera)
 
 
 if __name__ == "__main__":
