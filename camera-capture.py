@@ -5,14 +5,22 @@
 
 import os
 import time
+from pathlib import Path
 import sqlite3
 import sys
 import cv2
-from typing import Generator, Literal
+from typing import Generator, Literal, Protocol
 import ultralytics
 from PIL import Image
 from dataclasses import dataclass
 from ultralytics.engine.model import Results
+
+# SET EXPERIMENT SETTINGS HERE!!!
+DATABASE = "results.db"
+TARGET_CLASS = "car"
+ANGLES = list(range(0, 360, 45))
+HEIGHTS = [0.0, 16.0, 38.0]
+DISTANCES = [33.0, 50, 84, 96, 130]
 
 CREATETABLE = """CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -28,7 +36,7 @@ CREATETABLEDETECTIONS = """
 CREATE TABLE IF NOT EXISTS detections (
     id INTEGER PRIMARY KEY,
     prediction_id INTEGER NOT NULL,
-    class INTEGER NOT NULL,
+    class TEXT NOT NULL,
     prob FLOAT NOT NULL,
     FOREIGN KEY (prediction_id) REFERENCES predictions(id)
 );
@@ -45,10 +53,12 @@ CREATE TABLE IF NOT EXISTS predictions (
 )
 """
 
-TARGET_CLASS = 0
-
 
 class DeadError(Exception):
+    pass
+
+
+class Back(Exception):
     pass
 
 
@@ -62,17 +72,44 @@ def green(text: str) -> str:
     return f"{green_color}{text}{reset_color}"
 
 
+def camera_capture(camera: cv2.VideoCapture) -> Image.Image:
+    """Camera IO, and input management.
+
+    Show camera and wait for human input, to proccede.
+    Note, this is where I would append further human interaction.
+    Exceptions are used as control signals as they propagate all the way up to the
+    event loop. This is not great.
+    """
+    win_name = "experiment"
+    while True:
+        alive, img = camera.read()
+        if not alive:
+            raise DeadError("Camera is very dead, try again mr bean.")
+        cv2.imshow(win_name, img)
+        in_ = cv2.waitKey(1)
+        if in_ == ord("q"):
+            raise Exit()
+        elif in_ == ord("h"):
+            cv2.destroyWindow(win_name)
+            raise Back()
+        elif in_ == ord(" "):
+            cv2.destroyWindow(win_name)
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            return pil
+
+
 @dataclass
 class Experiment:
     experiment_id: int
     camera_height: float
     camera_angle: int
     camera_distance: float
+    data_root: Path
+    frame_id: int
 
     @property
     def image_name(self) -> str:
-        experiment_summary = f"Height:{self.camera_height}\nDistance:{self.camera_distance}\nAngle:{self.camera_angle}"
-        return experiment_summary
+        return f"{self.frame_id:05d}.png"
 
     def summarise(
         self,
@@ -96,19 +133,7 @@ class Experiment:
         return experiment_summary
 
     def _capture(self, camera: cv2.VideoCapture) -> Image.Image:
-        win_name = "experiment"
-        while True:
-            alive, img = camera.read()
-            if not alive:
-                raise DeadError("Camera is very dead, try again mr bean.")
-            cv2.imshow(win_name, img)
-            in_ = cv2.waitKey(1)
-            if in_ == ord("q"):
-                raise Exit()
-            if in_ == ord(" "):
-                cv2.destroyWindow(win_name)
-                pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-                return pil
+        return camera_capture(camera)
 
     def run(
         self,
@@ -116,68 +141,99 @@ class Experiment:
         yolo: ultralytics.YOLO,
         conn: sqlite3.Connection,
     ) -> None:
+        os.system("cls" if os.name == "nt" else "clear")
+        print(self.summarise("camera_angle"))
+
         pil = self._capture(camera)
+        pil.save(self.data_root / f"{self.frame_id}.png")
+
         [predictions] = yolo(pil)
+        vk = {v: k for k, v in yolo.names.items()}[TARGET_CLASS]
+
         insert_detections(
             conn,
             predictions,
             self,
-            {TARGET_CLASS},
+            {vk},
             self.experiment_id,
         )
 
 
+class Runnable(Protocol):
+    def run(
+        self,
+        camera: cv2.VideoCapture,
+        yolo: ultralytics.YOLO,
+        conn: sqlite3.Connection,
+    ) -> None: ...
+
+
+@dataclass
+class Aiming:
+    msg: str
+
+    def run(
+        self,
+        camera: cv2.VideoCapture,
+        yolo: ultralytics.YOLO,
+        conn: sqlite3.Connection,
+    ) -> None:
+        os.system("cls" if os.name == "nt" else "clear")
+        print(self.msg)
+        camera_capture(camera)
+
+
 @dataclass
 class Experiments:
+    data_root: Path
     heights_cm: list[float]
     angles: list[int]
     distances_cm: list[float]
     id: int | None
 
-    def generate_settings(
-        self, camera: cv2.VideoCapture
-    ) -> Generator[Experiment, None, None]:
+    def generate_settings(self) -> Generator[Runnable, None, None]:
         if self.id is None:
             raise ValueError(
                 "Commit the settings to database before you do recoriding mr bean."
             )
         heights_count = len(self.heights_cm)
         distances_count = len(self.distances_cm)
+        ii = 0
+        data_root = self.data_root.joinpath(str(self.id))
+        data_root.mkdir()
+
         for i, height in enumerate(self.heights_cm):
             for j, distance in enumerate(self.distances_cm):
-                for k, angle in enumerate(self.angles):
+                for _, angle in enumerate(self.angles):
                     exp = Experiment(
+                        data_root=data_root,
                         camera_height=height,
                         camera_angle=angle,
                         experiment_id=self.id,
                         camera_distance=distance,
+                        frame_id=ii,
                     )
 
-                    os.system("cls" if os.name == "nt" else "clear")
-
-                    print(exp.summarise("camera_angle"))
-                    print("Press space to capture")
                     yield exp
+                    ii += 1
 
                 next_distance = j + 1
-                if next_distance == distances_count:
-                    print("Final Distance")
-                else:
-                    os.system("cls" if os.name == "nt" else "clear")
-                    print(
-                        green(f"Change Distance to {self.distances_cm[next_distance]}")
+                if next_distance != distances_count:
+                    msg = green(
+                        f"Change Distance to {self.distances_cm[next_distance]}"
                     )
-                    print("Once alligned press space")
-                    exp._capture(camera)
+                    msg += "\nOnce alligned press space"
+
+                    yield Aiming(msg)
+                else:
+                    msg = "Final Distance"
+                    yield Aiming(msg)
 
             next_height = i + 1
-            if next_height == heights_count:
-                print("End")
-            else:
-                os.system("cls" if os.name == "nt" else "clear")
-                print(green(f"Change Height to {self.heights_cm[next_height]}"))
-                print("Once alligned press space")
-                exp._capture(camera)
+            if next_height != heights_count:
+                msg = green(f"Change Height to {self.heights_cm[next_height]}")
+                msg += "\nOnce alligned press space"
+                yield Aiming(msg)
 
     @property
     def name(self) -> str:
@@ -205,30 +261,18 @@ class Experiments:
         self.id = int(id[0])
 
 
-def insert_detections(
+def _insert_boxes(
     conn: sqlite3.Connection,
     predictions: Results,
-    image_metadata: Experiment,
+    prediction_id: int,
     target_cls: set[int],
-    run_id: int,
 ) -> None:
     boxes = predictions.boxes
-
-    (prediction_id,) = conn.execute(
-        "INSERT INTO predictions (run_id, image_name, camera_height, camera_distance, camera_angle) VALUES (?, ?, ?, ?, ?) RETURNING id;",
-        (
-            run_id,
-            image_metadata.image_name,
-            image_metadata.camera_height,
-            image_metadata.camera_distance,
-            image_metadata.camera_angle,
-        ),
-    ).fetchone()
-
     if boxes is None:
         return
 
     classes = boxes.cls.tolist()
+    predictions.names
     probs = boxes.conf.tolist()
     for cls, prob in zip(classes, probs):
         if int(cls) not in target_cls:
@@ -236,75 +280,90 @@ def insert_detections(
 
         conn.execute(
             "INSERT INTO detections (class, prob, prediction_id) VALUES (?, ?, ?);",
-            (cls, prob, prediction_id),
+            (predictions.names[cls], prob, prediction_id),
         )
 
     conn.commit()
 
 
-def list_ports():
-    """
-    Test the ports and returns a tuple with the available ports and the ones that are working.
-    """
-    non_working_ports = []
-    dev_port = 0
-    working_ports = []
-    available_ports = []
-    while (
-        len(non_working_ports) < 6
-    ):  # if there are more than 5 non working ports stop the testing.
-        camera = cv2.VideoCapture(dev_port)
-        if not camera.isOpened():
-            non_working_ports.append(dev_port)
-            print("Port %s is not working." % dev_port)
-        else:
-            is_reading, img = camera.read()
-            w = camera.get(3)
-            h = camera.get(4)
-            if is_reading:
-                print(
-                    "Port %s is working and reads images (%s x %s)" % (dev_port, h, w)
-                )
-                working_ports.append(dev_port)
-            else:
-                print(
-                    "Port %s for camera ( %s x %s) is present but does not reads."
-                    % (dev_port, h, w)
-                )
-                available_ports.append(dev_port)
-        dev_port += 1
-    return available_ports, working_ports, non_working_ports
-
-
-def see_stuff() -> None:
-    for i in range(0, 10):
-        camera = cv2.VideoCapture(i)
-        while True:
-            alive, img = camera.read()
-            if not alive:
-                continue
-            cv2.imshow("Check", img)
-            in_ = cv2.waitKey()
-            if in_ == ord("q"):
-                break
-        cv2.destroyWindow("Check")
-        camera.release()
+def insert_detections(
+    conn: sqlite3.Connection,
+    predictions: Results,
+    image_metadata: Experiment,
+    target_cls: set[int],
+    run_id: int,
+) -> None:
+    out = conn.execute(
+        "SELECT id FROM predictions where image_name = ? and run_id = ?;",
+        (image_metadata.image_name, run_id),
+    ).fetchone()
+    # If row doesn't exist make it.
+    if out is None:
+        (prediction_id,) = conn.execute(
+            "INSERT INTO predictions (run_id, image_name, camera_height, camera_distance, camera_angle) VALUES (?, ?, ?, ?, ?) RETURNING id;",
+            (
+                run_id,
+                image_metadata.image_name,
+                image_metadata.camera_height,
+                image_metadata.camera_distance,
+                image_metadata.camera_angle,
+            ),
+        ).fetchone()
+    # If row does exist delete all the detections.
+    else:
+        prediction_id = out[0]
+        conn.execute(
+            "DELETE FROM detections WHERE prediction_id = ?;", (int(prediction_id),)
+        )
+        conn.commit()
+    _insert_boxes(
+        conn,
+        predictions,
+        prediction_id,
+        target_cls,
+    )
 
 
 def experiment() -> None:
+    """Run experiment interaction loop"""
+    data_root = os.getenv("DATA_ROOT", "/mnt/scratch/data/small_scale")
+    data_root = Path(data_root)
+    data_root.mkdir(exist_ok=True)
+
     os.environ["YOLO_VERBOSE"] = "False"
     yolo = ultralytics.YOLO()
+
     webcam_port = 0
     camera = cv2.VideoCapture(webcam_port)
-    conn = sqlite3.connect("results.db")
+
+    conn = sqlite3.connect(DATABASE)
     conn.execute(CREATETABLE)
     conn.execute(CREATETABLEDETECTIONS)
     conn.execute(CREATETABLEPREDICTIONS)
     try:
-        exps = Experiments([1.1], [0, 45, 90], [1.1, 1.2], id=None)
-        exps.store_experiment(conn, yolo.model_name, "test", ["car"])
-        for exp in exps.generate_settings(camera):
-            exp.run(camera, yolo, conn)
+        exps = Experiments(
+            data_root,
+            angles=ANGLES,
+            heights_cm=HEIGHTS,
+            distances_cm=DISTANCES,
+            id=None,
+        )
+        exps.store_experiment(conn, yolo.model_name, "test", [TARGET_CLASS])
+
+        ## Run experiments in a loop
+        ## Case where user wants to re run experiments
+        ## is handeled by the back error
+        ## Back is raised in camera_capture
+        exps = list(exps.generate_settings())
+        i = 0
+        while i < len(exps):
+            exp = exps[i]
+            try:
+                exp.run(camera, yolo, conn)
+            except Back:
+                i = max(i - 1, 0)
+                continue
+            i += 1
     except Exit:
         print("Exiting")
         sys.exit(1)
