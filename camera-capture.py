@@ -142,7 +142,9 @@ class Experiment:
         conn: sqlite3.Connection,
     ) -> None:
         os.system("cls" if os.name == "nt" else "clear")
+        print("Experiment")
         print(self.summarise("camera_angle"))
+        print("Press space to capture, q to exit and h to go back")
 
         pil = self._capture(camera)
         pil.save(self.data_root / f"{self.frame_id}.png")
@@ -224,9 +226,6 @@ class Experiments:
                     )
                     msg += "\nOnce alligned press space"
 
-                    yield Aiming(msg)
-                else:
-                    msg = "Final Distance"
                     yield Aiming(msg)
 
             next_height = i + 1
